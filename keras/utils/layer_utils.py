@@ -1,116 +1,91 @@
-from __future__ import print_function
-import inspect
+"""Utilities related to layer/model functionality.
+"""
+from .conv_utils import convert_kernel
+from .. import backend as K
 import numpy as np
-import theano
-import copy
-
-from ..layers.advanced_activations import LeakyReLU, PReLU
-from ..layers.core import Dense, Merge, Dropout, Activation, Reshape, Flatten, RepeatVector, Layer
-from ..layers.core import ActivityRegularization, TimeDistributedDense, AutoEncoder, MaxoutDense
-from ..layers.embeddings import Embedding, WordContextProduct
-from ..layers.noise import GaussianNoise, GaussianDropout
-from ..layers.normalization import BatchNormalization
-from ..layers.recurrent import SimpleRNN, SimpleDeepRNN, GRU, LSTM, JZS1, JZS2, JZS3
-from ..layers import containers
-from .. import regularizers
-from .. import constraints
 
 
-def container_from_config(original_layer_dict):
-    layer_dict = copy.deepcopy(original_layer_dict)
-    name = layer_dict.get('name')
-
-    if name == 'Merge':
-        mode = layer_dict.get('mode')
-        layers = layer_dict.get('layers')
-        layer_list = []
-        for layer in layers:
-            init_layer = container_from_config(layer)
-            layer_list.append(init_layer)
-        merge_layer = Merge(layer_list, mode)
-        return merge_layer
-
-    elif name == 'Sequential':
-        layers = layer_dict.get('layers')
-        layer_list = []
-        for layer in layers:
-            init_layer = container_from_config(layer)
-            layer_list.append(init_layer)
-        seq_layer = containers.Sequential(layer_list)
-        return seq_layer
-
-    elif name == 'Graph':
-        graph_layer = containers.Graph()
-        inputs = layer_dict.get('input_config')
-
-        for input in inputs:
-            graph_layer.add_input(**input)
-
-        nodes = layer_dict.get('node_config')
-        for node in nodes:
-            layer = container_from_config(layer_dict['nodes'].get(node['name']))
-            node['layer'] = layer
-            graph_layer.add_node(**node)
-
-        outputs = layer_dict.get('output_config')
-        for output in outputs:
-            graph_layer.add_output(**output)
-        return graph_layer
-
-    else:
-        layer_dict.pop('name')
-
-        for k, v in layer_dict.items():
-            # For now, this can only happen for regularizers and constraints
-            if isinstance(v, dict):
-                vname = v.get('name')
-                v.pop('name')
-                if vname in [x for x, y in inspect.getmembers(constraints, predicate=inspect.isclass)]:
-                    layer_dict[k] = constraints.get(vname, v)
-                if vname in [x for x, y in inspect.getmembers(regularizers, predicate=inspect.isclass)]:
-                    layer_dict[k] = regularizers.get(vname, v)
-
-        base_layer = get_layer(name, layer_dict)
-        return base_layer
+from tensorflow.keras.utils import get_source_inputs
+from tensorflow.python.keras.utils.layer_utils import print_summary
 
 
-def print_layer_shapes(model, input_shapes):
+def count_params(weights):
+    """Count the total number of scalars composing the weights.
+
+    # Arguments
+        weights: An iterable containing the weights on which to compute params
+
+    # Returns
+        The total number of scalars composing the weights
     """
-    Utility function to print the shape of the output at each layer of a Model
+    weight_ids = set()
+    total = 0
+    for w in weights:
+        if id(w) not in weight_ids:
+            weight_ids.add(id(w))
+            total += int(K.count_params(w))
+    return total
 
-    Arguments:
-        model: instance of Model / Merge
-        input_shapes: dict (Graph), list of tuples (Merge) or tuple (Sequential)
+
+def convert_all_kernels_in_model(model):
+    """Converts all convolution kernels in a model from Theano to TensorFlow.
+
+    Also works from TensorFlow to Theano.
+
+    # Arguments
+        model: target model for the conversion.
     """
-    if model.__class__.__name__ in ['Sequential', 'Merge']:
-        # in this case input_shapes is a tuple, or a list [shape1, shape2]
-        if not isinstance(input_shapes[0], tuple):
-            input_shapes = [input_shapes]
-
-        inputs = model.get_input(train=False)
-        if not isinstance(inputs, list):
-            inputs = [inputs]
-        input_dummy = [np.zeros(shape, dtype=np.float32)
-                       for shape in input_shapes]
-        layers = model.layers
-
-    elif model.__class__.__name__ == 'Graph':
-        # in this case input_shapes is a dictionary
-        inputs = [model.inputs[name].input
-                  for name in model.input_order]
-        input_dummy = [np.zeros(input_shapes[name], dtype=np.float32)
-                       for name in model.input_order]
-        layers = [model.nodes[c['name']] for c in model.node_config]
-
-    print("input shapes : ", input_shapes)
-    for l in layers:
-        shape_f = theano.function(inputs, l.get_output(train=False).shape,
-                                  on_unused_input='ignore')
-        out_shape = tuple(shape_f(*input_dummy))
-        config = l.get_config()
-        print('shape after %s: %s' % (config['name'], out_shape))
+    # Note: SeparableConvolution not included
+    # since only supported by TF.
+    conv_classes = {
+        'Conv1D',
+        'Conv2D',
+        'Conv3D',
+        'Conv2DTranspose',
+    }
+    to_assign = []
+    for layer in model.layers:
+        if layer.__class__.__name__ in conv_classes:
+            original_kernel = K.get_value(layer.kernel)
+            converted_kernel = convert_kernel(original_kernel)
+            to_assign.append((layer.kernel, converted_kernel))
+    K.batch_set_value(to_assign)
 
 
-from .generic_utils import get_from_module
-def get_layer(identifier, kwargs=None):
-    return get_from_module(identifier, globals(), 'layer', instantiate=True, kwargs=kwargs)
+def convert_dense_weights_data_format(dense,
+                                      previous_feature_map_shape,
+                                      target_data_format='channels_first'):
+    """Utility useful when changing a convnet's `data_format`.
+
+    When porting the weights of a convnet from one data format to the other,
+    if the convnet includes a `Flatten` layer
+    (applied to the last convolutional feature map)
+    followed by a `Dense` layer, the weights of that `Dense` layer
+    should be updated to reflect the new dimension ordering.
+
+    # Arguments
+        dense: The target `Dense` layer.
+        previous_feature_map_shape: A shape tuple of 3 integers,
+            e.g. `(512, 7, 7)`. The shape of the convolutional
+            feature map right before the `Flatten` layer that
+            came before the target `Dense` layer.
+        target_data_format: One of "channels_last", "channels_first".
+            Set it "channels_last"
+            if converting a "channels_first" model to "channels_last",
+            or reciprocally.
+    """
+    assert target_data_format in {'channels_last', 'channels_first'}
+    kernel, bias = dense.get_weights()
+    for i in range(kernel.shape[1]):
+        if target_data_format == 'channels_first':
+            c, h, w = previous_feature_map_shape
+            original_fm_shape = (h, w, c)
+            ki = kernel[:, i].reshape(original_fm_shape)
+            ki = np.transpose(ki, (2, 0, 1))  # last -> first
+        else:
+            h, w, c = previous_feature_map_shape
+            original_fm_shape = (c, h, w)
+            ki = kernel[:, i].reshape(original_fm_shape)
+            ki = np.transpose(ki, (1, 2, 0))  # first -> last
+        kernel[:, i] = np.reshape(ki, (np.prod(previous_feature_map_shape),))
+    dense.set_weights([kernel, bias])
